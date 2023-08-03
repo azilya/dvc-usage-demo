@@ -1,0 +1,34 @@
+stages:
+  generate:
+    cmd: >-
+      python gen_mongo_dump.py
+    deps:
+      - gen_mongo_dump.py
+    outs:
+      - dump/
+    always_changed: true
+  postprocess:
+    cmd: >-
+      python markup_mongo_dump.py ${data_dir}
+    deps:
+      - dump/
+      - markup_mongo_dump.py
+    outs:
+      - ${data_dir}/
+  train:
+    cmd: >-
+      python main.py
+    deps:
+      - ${data_dir}/
+      - main.py
+      - model/
+    outs:
+      - ${output_dir}/config.json:
+          persist: true
+      - ${output_dir}/pytorch_model.bin:
+          persist: true
+      - ${output_dir}/training_args.bin:
+          persist: true
+    metrics:
+      - metrics.json
+        # cache: false
