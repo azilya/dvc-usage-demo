@@ -4,7 +4,6 @@ import os
 import re
 import sys
 import unicodedata
-from datetime import datetime
 from string import punctuation
 
 # from nltk.corpus import stopwords
@@ -18,16 +17,7 @@ punctuation += "«»"
 
 def get_clean_text(text):
     text = unicodedata.normalize("NFKC", text)
-    text = (
-        text.replace(r"\n", " ")
-        .replace("\n", " ")
-        .replace("«", '"')
-        .replace("»", '"')
-        .replace("ё", "е")
-        .replace("Ё", "Е")
-    )
     text = "".join(c for c in text if not unicodedata.category(c).startswith("C"))
-    text = re.sub(r"\s+", " ", re.sub(f"([{punctuation}])", r" \1 ", text)).strip()
     return text
 
 
@@ -35,32 +25,16 @@ def sentence_parse(doc):
     sentences = []
     sentence_tags = []
     sentiments = []
-    for sent in doc["NewParse"]:
+    for sent in doc["Parse"]:
         text = get_clean_text(sent["Text"])
         tagged_tokens = {}
-        sentiment = "Neutral"
+        sentiment = sent.get("sentiment", "Neutral")
         entities = sent.get("Entities", [])
         if entities:
             for entity in entities:
                 name = get_clean_text(entity["EntityName"])
-                _sentiment = entity.get("sentiment", "Neutral")
-                _sentimentG = entity.get("gptEngSentiment", "Neutral")
                 search = re.search(re.escape(name), text, flags=re.I)
-                if search is None:
-                    word = doc["Text"][
-                        entity["EntityPositions"][0]["sent_offset"] : entity[
-                            "EntityPositions"
-                        ][0]["sent_offset"]
-                        + entity["EntityPositions"][0]["sent_length"]
-                    ]
-                    clean_word = get_clean_text(word)
-                    span = [
-                        text.index(clean_word),
-                        text.index(clean_word) + len(clean_word),
-                    ]
-
-                else:
-                    span = search.span()
+                span = search.span()
 
                 pre_tokens = wordpunct_tokenize(text[: span[0]])
                 entity_tokens = wordpunct_tokenize(text[span[0] : span[1]])
@@ -68,20 +42,13 @@ def sentence_parse(doc):
 
                 pre_tags = ["O"] * len(pre_tokens)
                 post_tags = ["O"] * len(post_tokens)
-                if _sentiment != "Wrong":
-                    entity_tags = ["B-ORG"] + ["I-ORG"] * (len(entity_tokens) - 1)
-                else:
-                    entity_tags = ["I-ERR"] * (len(entity_tokens))
-                _tokens = pre_tokens + entity_tokens + post_tokens
-                _tags = pre_tags + entity_tags + post_tags
-                assert len(_tokens) == len(_tags)
-                for i, (token, tag) in enumerate(zip(_tokens, _tags)):
+                entity_tags = ["B-ORG"] + ["I-ORG"] * (len(entity_tokens) - 1)
+                tokens = pre_tokens + entity_tokens + post_tokens
+                tags = pre_tags + entity_tags + post_tags
+                assert len(tokens) == len(tags)
+                for i, (token, tag) in enumerate(zip(tokens, tags)):
                     if i not in tagged_tokens or tagged_tokens[i][1] == "O":
                         tagged_tokens[i] = [token, tag]
-                if _sentimentG != "Neutral":
-                    sentiment = _sentimentG
-                elif _sentiment != "Neutral":
-                    sentiment = _sentiment
 
         if tagged_tokens != {}:
             sentences.append([tagged_tokens[i][0] for i in tagged_tokens])
@@ -123,30 +90,21 @@ def filter_sentences(sentences, sentence_tags, sentiments):
     return sentences, sentence_tags, sentiments
 
 
-settings = {
-    "collection": "Posts",
-    "find_field": "NewParse.Entities.gptEngSentiment",
-    "parse_func": sentence_parse,
-}
-
-
-def do_the_thing():
+def do_the_thing(db, coll):
     errors = []
     result = []
-    collection = MongoClient("mongodb://127.0.0.1:27017/")["MONGO_DB_NAME"][
-        settings["collection"]
-    ]
+    collection = MongoClient("mongodb://127.0.0.1:27017/")[db][coll]
     count = collection.count_documents(
-        {settings["find_field"]: {"$exists": True, "$ne": []}, "isRepost": None}
+        {"Parse": {"$exists": True, "$ne": []}, "isRepost": None}
     )
     for doc in tqdm(
         collection.find(
-            {settings["find_field"]: {"$exists": True, "$ne": []}, "isRepost": None},
-            {"Text": 1, "NewParse": 1},
+            {"Parse": {"$exists": True, "$ne": []}, "isRepost": None},
+            {"Text": 1, "Parse": 1},
         ),
         total=count,
     ):
-        tokens, tags, sent, err = settings["parse_func"](doc)
+        tokens, tags, sent, err = sentence_parse(doc)
         if err:
             errors.append(doc["_id"])
         else:
@@ -160,7 +118,7 @@ def do_the_thing():
                         "sentiment_label": text_sent,
                     }
                 )
-    fname = f"dump/{collection.name}_NewParse.jsonl"
+    fname = f"dump/{collection.name}_Parse.jsonl"
     with open(fname, "w", encoding="utf8") as f:
         for line in result:
             # line.pop("_id")

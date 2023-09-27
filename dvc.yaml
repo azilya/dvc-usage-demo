@@ -1,7 +1,7 @@
 stages:
   generate:
     cmd: >-
-      python gen_mongo_dump.py
+      python gen_mongo_dump.py db_name coll_name
     deps:
       - gen_mongo_dump.py
     outs:

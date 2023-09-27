@@ -1,12 +1,14 @@
 import json
+import os
 from dataclasses import dataclass, field
+from glob import glob
 from typing import Optional
 
+import mlflow
 import numpy as np
-from datasets import ClassLabel, load_dataset
-from dvclive.huggingface import DVCLiveCallback
-from evaluate import load
 import scipy
+from datasets import ClassLabel, load_dataset
+from evaluate import load as load_metric
 from transformers import (
     AutoConfig,
     AutoTokenizer,
@@ -18,16 +20,13 @@ from transformers import (
 )
 from transformers.trainer_utils import set_seed
 
-from dvclive import Live
 from model import JointBERT
 
 
 @dataclass
 class ModelArguments:
     model_name_or_path: str = field(
-        metadata={
-            "help": "Path to pretrained model or model identifier from huggingface.co/models"
-        },
+        metadata={"help": "Path to pretrained model or model identifier"},
     )
     dropout_rate: Optional[float] = field(
         default=0.1,
@@ -51,7 +50,7 @@ class ModelArguments:
     slot_pad_label: Optional[str] = field(
         default="PAD",
         metadata={
-            "help": "Pad token for slot label pad (to be ignore when calculate loss)",
+            "help": "Pad token for slot label pad (to ignore when calculating loss)",
         },
     )
 
@@ -77,7 +76,6 @@ class CustomTrainer(Trainer):
             slot_labels_ids=inputs["labels"],
         )
         # Save past state if it exists
-        # TODO: this needs to be fixed and made cleaner later.
         if self.args.past_index >= 0:
             self._past = outputs[self.args.past_index]
 
@@ -96,21 +94,15 @@ def main(
 
     data_files = {"train": "train.jsonl", "test": "test.jsonl", "dev": "dev.jsonl"}
     dataset = load_dataset(f"{data_args.data_dir}", data_files=data_files)
-    slot_label_lst = sorted(
-        set(t for e in dataset["train"]["labels"] for t in e)  # type: ignore
-    )
-    intent_label_lst = sorted(set(dataset["train"]["sentiment_label"]))  # type: ignore
+    slot_label_lst = sorted(set(t for ex in dataset["train"]["labels"] for t in ex))
+    intent_label_lst = sorted(set(dataset["train"]["sentiment_label"]))
     ner2id = {s: i for i, s in enumerate(slot_label_lst)}
     id2ner = {i: s for i, s in enumerate(slot_label_lst)}
     id2sent = {i: s for i, s in enumerate(intent_label_lst)}
     sent2id = {s: i for i, s in enumerate(intent_label_lst)}
 
-    dataset = dataset.cast_column(  # type: ignore
-        "sentiment_label", ClassLabel(names=intent_label_lst)
-    )
-    dataset = dataset.map(  # type: ignore
-        lambda y: {"labels": [ner2id[t] for t in y["labels"]]}
-    )
+    dataset = dataset.cast_column("sentiment_label", ClassLabel(names=intent_label_lst))
+    dataset = dataset.map(lambda y: {"labels": [ner2id[t] for t in y["labels"]]})
 
     tokenizer = AutoTokenizer.from_pretrained(
         model_args.model_name_or_path,
@@ -181,8 +173,12 @@ def main(
 
     tokenized_dataset = dataset.map(preprocess, batched=True)
     collator = DataCollatorForTokenClassification(tokenizer=tokenizer)
-    roc_auc = load("roc_auc", "multiclass")
-    seqeval = load("seqeval")
+    roc_auc = load_metric("roc_auc", "multiclass")
+    seqeval = load_metric("seqeval")
+
+    mlflow.log_param("dropout_rate", model_args.dropout_rate)
+    mlflow.log_param("max_seq_len", data_args.max_seq_len)
+    mlflow.log_params(training_args.to_dict())
 
     def compute_metrics(eval_pred):
         results = {}
@@ -190,13 +186,15 @@ def main(
             sentiment_labels,
             ner_label_ids,
         ) = eval_pred
-        sentiment_predictions = scipy.special.softmax(sentiment_predictions, axis=1)  # type: ignore
+        # evaluate SA
+        sentiment_predictions = scipy.special.softmax(sentiment_predictions, axis=1)
         sentiment_acc = roc_auc.compute(
             references=sentiment_labels,
             prediction_scores=sentiment_predictions,
             multi_class="ovr",
         )
         results["sentiment_roc_auc"] = sentiment_acc["roc_auc"]
+        # evaluate NER
         ner_prediction_ids = np.argmax(ner_prediction_ids, axis=-1)
         ner_prediction_labels = [[] for _ in range(ner_prediction_ids.shape[0])]
         ner_labels = [[] for _ in range(ner_label_ids.shape[0])]
@@ -207,49 +205,63 @@ def main(
                         model.config.id2ner[ner_prediction_ids[i, j]]
                     )
                     ner_labels[i].append(model.config.id2ner[ner_label_ids[i, j]])
-
         ner_acc = seqeval.compute(
             predictions=ner_prediction_labels, references=ner_labels
         )
+        # flatten metrics dictionary
         for ner_type in ner_acc:
             if isinstance(ner_acc[ner_type], dict):
                 for metric in ner_acc[ner_type]:
                     results[f"{ner_type}.{metric}"] = ner_acc[ner_type][metric]
             else:
                 results[f"{ner_type}"] = ner_acc[ner_type]
-        for name, metric in results.items():
-            live.log_metric(name, metric)
+        mlflow.log_metrics(results, step=trainer.state.global_step)
         return results
 
-    with Live(save_dvc_exp=True) as live:
-        trainer = CustomTrainer(
-            model=model,
-            args=training_args,
-            train_dataset=tokenized_dataset["train"],  # type: ignore
-            eval_dataset=tokenized_dataset["dev"],  # type: ignore
-            tokenizer=tokenizer,
-            data_collator=collator,
-            compute_metrics=compute_metrics,
+    trainer = CustomTrainer(
+        model=model,
+        args=training_args,
+        train_dataset=tokenized_dataset["train"],
+        eval_dataset=tokenized_dataset["dev"],
+        tokenizer=tokenizer,
+        data_collator=collator,
+        compute_metrics=compute_metrics,
+    )
+
+    if training_args.do_train:
+        trainer.train()
+        trainer.save_model(training_args.output_dir)
+
+        mlflow.pytorch.log_model(
+            trainer.model,
+            artifact_path="jointBERT",
+            registered_model_name="construction-JointBERT",
+            code_paths=["./model"],
+            pip_requirements=[
+                "torch~=1.11.0",
+                "transformers~=4.30.2",
+                "pytorch-crf==0.7.2",
+            ],
         )
-        trainer.add_callback(DVCLiveCallback(save_dvc_exp=True, live=live))
+        for artifact in glob(training_args.output_dir.strip("/") + "/*"):
+            if os.path.isfile(artifact):
+                mlflow.log_artifact(artifact, "model/")
 
-        if training_args.do_train:
-            trainer.train()
-            trainer.save_model(training_args.output_dir)
+    if training_args.do_eval:
+        results = trainer.evaluate(tokenized_dataset["test"])
 
-        if training_args.do_eval:
-            results = trainer.evaluate(tokenized_dataset["test"])  # type: ignore
-
-            # log json
-            with open("metrics.json", "w") as metrics:
-                metrics.write(json.dumps(results, ensure_ascii=False, indent=4))
+        # log json
+        with open("metrics.json", "w") as metrics:
+            metrics.write(json.dumps(results, ensure_ascii=False, indent=4))
 
 
 if __name__ == "__main__":
     parser = HfArgumentParser((DataArguments, ModelArguments, TrainingArguments))
-
     data_args, model_args, training_args = parser.parse_yaml_file(
         "./params.yaml", allow_extra_keys=True
     )
-
-    main(data_args, model_args, training_args)
+    run_name = os.getenv("DVC_EXP_NAME", "undefined")
+    mlflow.set_tracking_uri("http://localhost:5100")
+    mlflow.set_experiment(training_args.output_dir)
+    with mlflow.start_run(run_name=run_name):
+        main(data_args, model_args, training_args)

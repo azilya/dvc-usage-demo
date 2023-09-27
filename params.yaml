@@ -1,7 +1,6 @@
-## Transformers args
 # data args
 data_dir: "markup_from_dump"
-output_dir: "model_2"
+output_dir: "result"
 model_name_or_path: "DeepPavlov/rubert-base-cased"
 label_names: ["sentiment_label", "labels"]
 # stages
