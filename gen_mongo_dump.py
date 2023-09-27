@@ -15,40 +15,41 @@ from tqdm import tqdm
 punctuation += "«»"
 
 
-def get_clean_text(text):
+def get_clean_text(text: str):
+    """
+    Removes weird ivisible symbols and makes sure
+    that one visible symbol corresponds to one character
+
+    Args:
+        text (str): input text
+
+    Returns:
+        str: clean text
+    """
     text = unicodedata.normalize("NFKC", text)
     text = "".join(c for c in text if not unicodedata.category(c).startswith("C"))
     return text
 
 
-def sentence_parse(doc):
+def text_parse(doc: dict):
+    """
+    Given a text split into sentences,
+    returns for each sentence a list of tokens,
+    corresponding list of BIO-tags and its sentiment.
+
+    Args:
+        doc (dict): mongoDB document with a "Parse" field,
+        containing list of sentences in text with NE and SA results
+
+    Returns:
+        tuple(list, list, list, bool): list of tokens, list of tags, list of sentiments,
+        whether something went wrong during parse
+    """
     sentences = []
     sentence_tags = []
     sentiments = []
     for sent in doc["Parse"]:
-        text = get_clean_text(sent["Text"])
-        tagged_tokens = {}
-        sentiment = sent.get("sentiment", "Neutral")
-        entities = sent.get("Entities", [])
-        if entities:
-            for entity in entities:
-                name = get_clean_text(entity["EntityName"])
-                search = re.search(re.escape(name), text, flags=re.I)
-                span = search.span()
-
-                pre_tokens = wordpunct_tokenize(text[: span[0]])
-                entity_tokens = wordpunct_tokenize(text[span[0] : span[1]])
-                post_tokens = wordpunct_tokenize(text[span[1] :])
-
-                pre_tags = ["O"] * len(pre_tokens)
-                post_tags = ["O"] * len(post_tokens)
-                entity_tags = ["B-ORG"] + ["I-ORG"] * (len(entity_tokens) - 1)
-                tokens = pre_tokens + entity_tokens + post_tokens
-                tags = pre_tags + entity_tags + post_tags
-                assert len(tokens) == len(tags)
-                for i, (token, tag) in enumerate(zip(tokens, tags)):
-                    if i not in tagged_tokens or tagged_tokens[i][1] == "O":
-                        tagged_tokens[i] = [token, tag]
+        tagged_tokens, sentiment = sentence_parse(sent)
 
         if tagged_tokens != {}:
             sentences.append([tagged_tokens[i][0] for i in tagged_tokens])
@@ -63,11 +64,66 @@ def sentence_parse(doc):
     return sentences, sentence_tags, sentiments, error
 
 
-def filter_sentences(sentences, sentence_tags, sentiments):
-    tmp = [set(s) for s in sentence_tags]
+def sentence_parse(sent: dict):
+    """Generates BIO-markup for sentence of the text, based on extracted NE's.
+
+    Args:
+        sent (dict): document field with NE+SA results.
+        Has fields:
+        * "Text" for sentence text,
+        * "Sentiment" for sentiment,
+        * "Entities" for extracted NE's with "EntityName" as corresponding text fragment
+
+    Returns:
+        tuple(dict, str): BIO-tags for tokens of the sentence, sentence sentiment
+    """
+    text = get_clean_text(sent["Text"])
+    tagged_tokens = {}
+    # for the sake of experiment we assume
+    # that sentiment of the sentence relates to the entity as well
+    sentiment = sent.get("sentiment", "Neutral")
+    entities = sent.get("Entities", [])
+    if entities:
+        for entity in entities:
+            name = get_clean_text(entity["EntityName"])
+            # we have only the name, but not coordinates in text
+            search = re.search(re.escape(name), text, flags=re.I)
+            span = search.span()
+
+            pre_tokens = wordpunct_tokenize(text[: span[0]])
+            entity_tokens = wordpunct_tokenize(text[span[0] : span[1]])
+            post_tokens = wordpunct_tokenize(text[span[1] :])
+
+            pre_tags = ["O"] * len(pre_tokens)
+            post_tags = ["O"] * len(post_tokens)
+            entity_tags = ["B-ORG"] + ["I-ORG"] * (len(entity_tokens) - 1)
+            tokens = pre_tokens + entity_tokens + post_tokens
+            tags = pre_tags + entity_tags + post_tags
+            assert len(tokens) == len(tags)
+            for i, (token, tag) in enumerate(zip(tokens, tags)):
+                # there can be several entities, so we need to update markup every time
+                if i not in tagged_tokens or tagged_tokens[i][1] == "O":
+                    tagged_tokens[i] = [token, tag]
+    return tagged_tokens, sentiment
+
+
+def filter_sentences(sentences: list, sentence_tags: list, sentiments: list):
+    """
+    If there is more than 1/2 of sentences without NE's in set,
+    filters out some of them to create a more balanced set
+
+    Args:
+        sentences (list)
+        sentence_tags (list)
+        sentiments (list)
+
+    Returns:
+        Filtered lists of tokens/tags/sentiments
+    """
+    tmp = [set(stags) for stags in sentence_tags]
     if len(tmp) == 0:
         return [], [], []
-    if tmp.count({"O"}) / len(tmp) >= 0.5:
+    if tmp.count({"O"}) / len(tmp) > 0.5:
         new_tok = []
         new_tags = []
         new_sent = []
@@ -91,6 +147,9 @@ def filter_sentences(sentences, sentence_tags, sentiments):
 
 
 def do_the_thing(db, coll):
+    """
+    Parse all documents in the collection and generate a dump in the pre-defined folder
+    """
     errors = []
     result = []
     collection = MongoClient("mongodb://127.0.0.1:27017/")[db][coll]
@@ -104,7 +163,7 @@ def do_the_thing(db, coll):
         ),
         total=count,
     ):
-        tokens, tags, sent, err = sentence_parse(doc)
+        tokens, tags, sent, err = text_parse(doc)
         if err:
             errors.append(doc["_id"])
         else:
@@ -128,6 +187,6 @@ def do_the_thing(db, coll):
 
 if __name__ == "__main__":
     os.makedirs("dump", exist_ok=True)
-
-    fname = do_the_thing()
+    db, coll = sys.argv[1:3]
+    fname = do_the_thing(db, coll)
     logging.info(f"Written {fname}")
