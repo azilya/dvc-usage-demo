@@ -7,7 +7,7 @@ stages:
     outs:
       - dump/
     always_changed: true
-  postprocess:
+  preprocess:
     cmd: >-
       python markup_mongo_dump.py ${data_dir}
     deps:
