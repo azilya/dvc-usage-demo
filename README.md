@@ -17,8 +17,23 @@ We create a `dvc.yaml` file with the following stages: `generate` to create the 
 
 ## Dataset creation
 
-## Markup
+`gen_mongo_dump.py` reads documents from the provided mongoDB collection, assuming they have the target field with parse results. For every sentence BIO-markup of extracted named entities is generated, and it is attributed with the results of sentiment analysis. Finally the generated dataset is saved as a .jsonl file in ./dump directory.
+
+## Preprocessing
+
+`markup_mongo_dump.py` splits the generated dump in training, dev and test sets, making sure sentiment labels are evenly distributed among all three sets using `scikit-learn` library.
 
 ## Model training
 
+`main.py` implements standard `transformers` pipeline for loading datasets, a model and a tokenizer and training the model on the tokenized and vectorized dataset. As in the experiment we want to solve two problems simultaneously, quality of both NER and SA is evaluated. Hyperparameters for training, as well as other launch arguments are taken from `parameters.yaml` file.
+
+The `model` folder with the JointBERT code can be found in the [source repository](https://github.com/monologg/JointBERT).
+
 ## Tracking results
+
+An MLFlow storage is used to store training artifacts (model and tokenizer), and track evaluation results.
+For simplicity reasons here we assume that the tracking server is launched locally:
+
+```sh
+mlflow server -p 5100
+```
